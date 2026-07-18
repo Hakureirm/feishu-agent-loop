@@ -1,0 +1,10 @@
+{
+  "name": "feishu-agent-loop",
+  "description": "Supervise long-running autonomous agent tasks from Feishu (Lark): the agent pushes markdown progress via a bot, and user replies wake it instantly through Feishu's long-connection WebSocket event stream (no polling). Provides the send/receive/self-pacing recipe, delivery verification rules, and hard-won pitfall list for lark-cli based loops. 飞书遥控长任务 Agent:bot 推进度 + 回复秒级唤醒 + 自定步长,含送达校验与血泪坑清单。",
+  "version": "1.0.0",
+  "author": { "name": "Hakureirm", "url": "https://github.com/Hakureirm" },
+  "homepage": "https://github.com/Hakureirm/feishu-agent-loop",
+  "repository": "https://github.com/Hakureirm/feishu-agent-loop",
+  "license": "Apache-2.0",
+  "keywords": ["feishu", "lark", "agent", "remote-control", "long-running-tasks", "claude-code", "lark-cli", "websocket"]
+}

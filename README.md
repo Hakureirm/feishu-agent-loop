@@ -18,7 +18,7 @@
 
 ## 二、为什么好用
 
-- **手机遥控多小时自主任务**:Agent 自己跑,人只在关键处点一下方向(本次:精度评测中途从 40k→1M token、从"和公布值比"改成"官方 API 头对头")。
+- **手机遥控多小时自主任务**:Agent 自己跑,人只在关键处点一下方向(如:评测中途调大生成预算、切换对比基准)。
 - **零轮询、低延迟**:回复秒级唤醒,不烧 token 空转。
 - **结构化进度**:markdown 表直接在飞书渲染(对比表/容量表/配置表),比纯文字清楚得多。
 - **可审计**:每条进度都有 `message_id`,发没发得出去可验证。
@@ -78,4 +78,11 @@ done
 
 ## 六、开源
 
-见 [`SKILL.md`](./SKILL.md):把这套封装成一个 Claude Code skill(`feishu-agent-loop`),任何跑长任务的 Agent 都能挂上飞书遥控。**安装**:把本仓复制为 `~/.claude/skills/feishu-agent-loop/` 即可被 Claude Code 识别。License:Apache-2.0。
+本仓即标准 **Claude Code 插件**(含 `.claude-plugin/` manifest 与 `skills/` 布局)。
+
+**安装(Claude Code 内两条命令)**:
+```
+/plugin marketplace add Hakureirm/feishu-agent-loop
+/plugin install feishu-agent-loop@feishu-agent-loop
+```
+装完后当你说"用飞书盯着/汇报进度"时,`feishu-agent-loop` skill 自动生效(见 [`skills/feishu-agent-loop/SKILL.md`](./skills/feishu-agent-loop/SKILL.md))。也可手动复制 `skills/feishu-agent-loop/` 到 `~/.claude/skills/`。License:Apache-2.0。
