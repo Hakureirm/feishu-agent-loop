@@ -15,7 +15,8 @@ description: 让长时间自主任务(/loop、多小时评测/训练/迁移)通�
 1. `lark-cli` 已登录:`lark-cli api GET /open-apis/authen/v1/user_info` 回 code 0。
 2. 有 bot 应用,权限含 `im:message`(发)+ `im:message.p2p_msg:readonly`(收 P2P)。
 3. 开发者后台 → 事件与回调 → **长连接模式** → 已订阅 `im.message.receive_v1`(没订阅则连上也 RECEIVED:0)。
-4. 拿到 bot↔用户的 **P2P 会话 id**(`oc_...`)或用户 `open_id`(`ou_...`)。
+4. 用户身份若要代发消息需 `im:message.send_as_user`(`auth login --recommend` 不含);Agent 汇报只用 `--as bot`,无需此 scope。
+5. 拿到 bot↔用户的 **P2P 会话 id**(`oc_...`)或用户 `open_id`(`ou_...`)。
    - 查 P2P 会话最近消息:`lark-cli api GET /open-apis/im/v1/messages --as bot --params '{"container_id_type":"chat","container_id":"<oc_...>","sort_type":"ByCreateTimeDesc","page_size":5}'`
 
 ## 步骤
@@ -23,14 +24,19 @@ description: 让长时间自主任务(/loop、多小时评测/训练/迁移)通�
 ### 1. 装回调(常驻 Monitor,唤醒源)
 把下面挂成 persistent Monitor —— 用户一回消息就以 `<task-notification>` 唤醒你的 `/loop`:
 ```bash
+export LARKSUITE_CLI_NO_UPDATE_NOTIFIER=1 LARKSUITE_CLI_NO_SKILLS_NOTIFIER=1
 while true; do
-  lark-cli event consume im.message.receive_v1 --as bot --quiet --timeout 600s \
-    --jq '{from:(.sender_id//"?"),mtype:(.message_type//"?"),content:(.content//"")}'
-done
+  lark-cli event consume im.message.receive_v1 --as bot --timeout 600s --max-events 1 2>/dev/null
+  sleep 1
+done | jq --unbuffered -r 'select(.type=="im.message.receive_v1")
+  | "FEISHU_MSG from=\(.sender_id) chat=\(.chat_id) type=\(.message_type) id=\(.message_id) text=\(.content)"'
 ```
 - **必须** `--timeout`(有界化):无界 consume 在 Monitor 里读 stdin=EOF 会秒退。
-- jq 字段在**顶层**:`.sender_id`/`.message_type`/`.content`。别用嵌套路径。
-- `lark-cli event status` 见 `Active consumers=1` 即成。只装一次;后续 loop 先 TaskList,已在跑就跳过。
+- **必须** `--max-events 1` 并外层循环:CLI 走管道时 stdout 有缓冲,`--jq` 的输出会卡到进程退出才刷出;每收一条就退出、循环重连,事件才能即时进 Monitor(bus 守护常驻 30s,重连秒级)。2026-09-04 实测:不加它 `RECEIVED:1` 但 Monitor 零输出。
+- 用外部 `jq --unbuffered` 做格式化,**不要用 `--quiet`**(CLI 自己的 help 说它会隐藏事件丢失诊断)。
+- 事件字段在**顶层**(2026-09-04 实测):`type` `event_id` `message_id` `chat_id` `chat_type`(p2p/group) `message_type` `sender_id` `sender_type` `content`(预渲染文本) `create_time`。别写嵌套路径。
+- 自检:`lark-cli event status` 见 `Active consumers: 1`,且 `RECEIVED` 随消息递增。只装一次;后续 loop 先 TaskList,已在跑就跳过。
+- 应用版本未发布/审核中时会打印 `skipped console precheck: app has no published version`,**不影响长连接**。
 
 ### 2. 发进度(每次必验 ok)
 ```bash

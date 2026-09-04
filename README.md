@@ -26,7 +26,7 @@
 ## 三、配方(可直接抄)
 
 ### 前置
-- `lark-cli` 已登录(用户 token),且有一个飞书 bot 应用(开放平台自建应用即可)。
+- `lark-cli` 已登录(用户 token),且有一个飞书 bot 应用(`lark-cli config init --new` 一键在自己租户下创建即可)。
 - bot 需权限 `im:message`(发)+ `im:message.p2p_msg:readonly`(收 P2P)。
 - 开发者后台 → 事件与回调 → **长连接模式** → 订阅 `im.message.receive_v1`(否则连上也收不到推送)。
 
@@ -63,6 +63,9 @@ done
 4. **后台不订阅收不到**:长连接建了但 `RECEIVED:0` → 去开发者后台把 `im.message.receive_v1` 加进长连接订阅。
 5. **P2P 会话 ≠ 自聊**:bot 发的是 bot↔用户 P2P 会话(`oc_...`),读用户回复也查这个会话;别和用户自聊会话搞混。
 6. **幂等键防重发**:不确定上一条发没发成功时,带 `--idempotency-key` 重发不会产生重复。
+7. **管道缓冲吃掉事件**(2026-09-04):`event consume --jq` 挂在 Monitor 里,`event status` 显示 `RECEIVED:1` 但 Monitor 零输出——CLI 走管道时 stdout 缓冲到退出才刷。→ `--max-events 1` + 外层 `while` 循环重连;格式化改用外部 `jq --unbuffered`;别用 `--quiet`。
+8. **用户身份代发需额外 scope**:`--as user` 发消息要 `im:message.send_as_user`,`--recommend` 不含;Agent 汇报一律 `--as bot`。
+9. **应用审核中也能收事件**:`skipped console precheck: app has no published version` 只是跳过预检,长连接照常。
 
 ## 五、协作时间线(示意)
 
