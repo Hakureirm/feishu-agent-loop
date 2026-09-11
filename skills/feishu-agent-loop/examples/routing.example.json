@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "lines": ["engineering", "research"],
+  "allowed_senders": ["ou_ALLOWED_USER"],
+  "groups": {
+    "oc_ENGINEERING_GROUP": "engineering",
+    "oc_RESEARCH_GROUP": "research"
+  }
+}

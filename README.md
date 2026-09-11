@@ -1,108 +1,158 @@
 # Feishu-Driven Autonomous Agent Loop · 飞书驱动的自主 Agent 回路
 
-> **EN TL;DR** — A recipe + Claude Code skill that turns any long-running autonomous agent task into a loop you can supervise from your phone via Feishu (Lark): the agent pushes markdown progress through a bot, and your replies wake it **instantly** through Feishu's long-connection (WebSocket) event stream — no polling. Battle-tested over a real multi-hour run (LLM eval + RL training ops). Chinese docs below; the skill file is [`SKILL.md`](./SKILL.md).
+> **EN TL;DR** — Supervise long-running agent tasks from Feishu/Lark: bot progress messages, event-driven wakeups, and a long fallback heartbeat. Version 1.1 adds a bounded listener, configured sender/group routing, a private outbox, receipt validation, and offline regression tests. Routing is **not authorization**. This is not a durable queue, a session lease service, or an exactly-once delivery system. See the [skill](skills/feishu-agent-loop/SKILL.md).
 
-> 让一个跑数小时的**自主 Agent 任务**,被人在**手机飞书**上全程盯着、随时改方向 —— Agent 主动推进度,你回一句就能改它的下一步,而且你的回复会**秒级唤醒** Agent(不是轮询)。
->
-> 本模式在一次真实的多小时任务里跑通并打磨(LLM 量化精度评测 + 服务压测 + RL 训练运维:Agent 边跑边把评测分数、吞吐曲线、并行配置用 markdown 表推到飞书;监督者在手机上随时修正评测口径、追加压测维度、调整训练方向,Agent 每条都即时接住并改策略)。
+让 Agent 推进长任务，人通过手机飞书看结果、补充要求和调整方向。事件通过长连接回传，不靠模型频繁轮询；但**事件到达、调度唤醒、模型开始处理是不同时间点**，不能承诺回复总在几秒内完成。
 
-## 一、这套组合是什么(三块)
+## 1. 三块组合与实现范围
 
 | 块 | 作用 | 载体 |
 |---|---|---|
-| **① 进度推送** | Agent 主动把进展/结果发给人 | `lark-cli im +messages-send --as bot`(text/markdown) |
-| **② 指令回传** | 人回一句 → 立刻唤醒 Agent 改方向 | `lark-cli event consume im.message.receive_v1 --as bot`(长连接 WebSocket)挂成常驻 Monitor,回复以 task-notification 唤醒回路 |
-| **③ 自定步长** | 没事件时按节奏自检 | `/loop` + ScheduleWakeup(兜底心跳) |
+| 进度推送 | 阶段结果、异常、需要确认的动作 | `lark-cli im +messages-send --as bot` |
+| 事件回传 | 长连接收消息，按发送者和工作线筛选 | [listen.sh](skills/feishu-agent-loop/scripts/listen.sh) + [events.py](skills/feishu-agent-loop/scripts/events.py) |
+| 自定步长 | 没事件时的低频兜底 | 宿主提供的 `/loop` / `ScheduleWakeup` |
 
-**关键:② 不是轮询。** 飞书开放平台的"长连接模式"用 WebSocket 推事件,用户一发消息,`event consume` 立刻吐一行 NDJSON → 变成 task-notification → 唤醒 Agent 回路。所以人回复到 Agent 响应是**秒级**,不用等下一个心跳。
+**当前代码实际实施：**
 
-## 二、为什么好用
+- 启动前校验发送者白名单、工作线、群归属和 outbox；未知字段、重复 JSON key、未登记工作线均拒绝。
+- 每次消费使用 `--timeout 600s --max-events 1`；保留 CLI stderr，不使用 `--quiet`。连续三次消费失败后停止并输出可见错误事件。
+- 捕获原始 NDJSON 后单独路由，分别检查退出码，不让管道末端的成功覆盖前端错误。消费失败却含非空输出，或发生解析错误时，立即停止并保留输入，不继续消费下一条。
+- 群消息按配置交给对应工作线；P2P 只有本地 outbox 能定位父消息属于本线且同一 chat 时才成为候选。未知归属输出无正文的通知和 capture_ref，以deferred状态保留原文，默认积累32条即停止。
+- 自发消息登记 outbox 后按 message ID 过滤，包括 `--as user` 发送后回流的 user 事件。
+- 校验发送回执的严格布尔 `ok=true`、identity、message ID 和 chat ID；outbox 为本地 0600 常规文件，锁冲突、裸空文件或结构格式损坏明确报错；不检测旧合法快照回滚，重复登记幂等。
 
-- **手机遥控多小时自主任务**:Agent 自己跑,人只在关键处点一下方向(如:评测中途调大生成预算、切换对比基准)。
-- **零轮询、低延迟**:回复秒级唤醒,不烧 token 空转。
-- **结构化进度**:markdown 表直接在飞书渲染(对比表/容量表/配置表),比纯文字清楚得多。
-- **可审计**:每条进度都有 `message_id`,发没发得出去可验证。
+**没有实施：** 同线多消费者排他、跨机器 lease、所有入站事件去重、持久队列/ACK、自动父消息查询、发布审批或端到端送达证明。详见 [ROADMAP](ROADMAP.md)。
 
-## 三、配方(可直接抄)
+## 2. 安装与前置
 
-### 前置
-- `lark-cli` 已登录(用户 token),且有一个飞书 bot 应用(`lark-cli config init --new` 一键在自己租户下创建即可)。
-- bot 需权限 `im:message`(发)+ `im:message.p2p_msg:readonly`(收 P2P)。
-- 开发者后台 → 事件与回调 → **长连接模式** → 订阅 `im.message.receive_v1`(否则连上也收不到推送)。
+这是标准 Claude Code 插件：
 
-### ① 发进度(每次必验 ok)
-```bash
-lark-cli im +messages-send --as bot \
-  --chat-id <bot↔用户的P2P会话 oc_...> \
-  --markdown "## 标题\n| 列A | 列B |\n|---|---|\n| 1 | 2 |" \
-  --idempotency-key <本条唯一key,防重发>
-# 然后解析返回 JSON:必须 ok==true 且 data.message_id 以 om_ 开头,才算送达
-```
-- 发文本用 `--text`,发表格/结构化用 `--markdown`(自动转飞书富文本 post,支持标题/表格/引用)。
-- `--user-id ou_...` 也能发(等价),但发到的是同一个 bot↔用户 P2P 会话。
-
-### ② 收回复(长连接回调,挂成常驻 Monitor)
-```bash
-# 有界化 + 循环续,避免无界 consume 读 stdin EOF 立刻退出
-export LARKSUITE_CLI_NO_UPDATE_NOTIFIER=1 LARKSUITE_CLI_NO_SKILLS_NOTIFIER=1
-while true; do
-  lark-cli event consume im.message.receive_v1 --as bot --timeout 600s --max-events 1 2>/dev/null
-  sleep 1
-done | jq --unbuffered -r 'select(.type=="im.message.receive_v1" and .sender_type=="user")
-  | "FEISHU_MSG from=\(.sender_id) chat=\(.chat_id) ctype=\(.chat_type) id=\(.message_id) text=\(.content)"'
-```
-- 在 Claude Code 里:把上面挂成 `Monitor`(persistent),用户回复即到达为 `<task-notification>`,唤醒 `/loop`。
-- `lark-cli event status` 看到 `Active consumers=1` 即连上。
-
-### ③ 自定步长
-- 用 `/loop <任务>` 进入动态自定步长;每轮末尾 `ScheduleWakeup`(兜底心跳,通常 1200–1800s),真正的唤醒靠 ① 的 Monitor 事件。
-
-## 四、血泪坑(本次踩过,已固化)
-
-1. **命令/flag 用错会静默失败**:曾用 `im +send --receive-id-type open_id --receive-id ou_... --content '{...}'`(错命令 `+send` + 错 flag `--receive-id`),CLI 返回 JSON 但 `ok:false`,**一条都没送达**,用户全程没收到还以为在装死。→ **只认 `+messages-send` + `--chat-id`/`--user-id` + `--text`/`--markdown`;每次发完必验 `ok:true` 且有 `om_` 开头的 message_id。** 别只 `tail` 看到 `_notice` 更新页脚就以为成了。
-2. **长连接挂 Monitor 会立刻退出**:无界 `event consume` 在 Monitor 环境读 stdin=EOF → 秒退。→ 加 `--timeout 600s` 有界化 + `while true` 续。
-3. **jq 字段在顶层**:`.sender_id` / `.message_type` / `.content`(content 是预渲染人类可读文本),别写嵌套 `.sender.sender_id` / `.message.content`(全空)。
-4. **后台不订阅收不到**:长连接建了但 `RECEIVED:0` → 去开发者后台把 `im.message.receive_v1` 加进长连接订阅。
-5. **P2P 会话 ≠ 自聊**:bot 发的是 bot↔用户 P2P 会话(`oc_...`),读用户回复也查这个会话;别和用户自聊会话搞混。
-6. **幂等键防重发**:不确定上一条发没发成功时,带 `--idempotency-key` 重发不会产生重复。
-7. **管道缓冲吃掉事件**(2026-09-04):`event consume --jq` 挂在 Monitor 里,`event status` 显示 `RECEIVED:1` 但 Monitor 零输出——CLI 走管道时 stdout 缓冲到退出才刷。→ `--max-events 1` + 外层 `while` 循环重连;格式化改用外部 `jq --unbuffered`;别用 `--quiet`。
-8. **用户身份代发需额外 scope**:`--as user` 发消息要 `im:message.send_as_user`,`--recommend` 不含;Agent 汇报一律 `--as bot`。
-9. **应用审核中也能收事件**:`skipped console precheck: app has no published version` 只是跳过预检,长连接照常。
-10. **群里不 @bot 的消息收不到**(2026-09-04):bot 进群后,群成员不 @ 它的消息不会推 `im.message.receive_v1`;要收全部群消息需管理员开 `im:message.group_msg` 且应用可用范围覆盖群成员。过渡期每 60 s 用 `im +chat-messages-list --as user` 轮询兜底,按 message_id 去重。
-11. **"连上了"≠"收得到"**:通道验收要用一条**不带 @ 的群消息**做阳性对照,不能只看 P2P。
-
-## 五、通知三档 + 失败回灌(2026-09-04 增补)
-
-| 档 | 何时 | 怎么发 |
-|---|---|---|
-| **Fyi** | 流水:一步完成、指标更新 | 落文件/流水群,不 @人 |
-| **ShouldSee** | 里程碑、异常、方向变化 | 普通消息,不等回复 |
-| **MustAck** | 部署 / 动 secret / 删数据 / 花钱 | 选项 + 默认值 + 截止;没回复不往下走;超时同 idempotency-key 重发一次 |
-
-- 未分类默认 ShouldSee;技术方案自己定,只有主权类动作才 MustAck。
-- 唤醒后把上一轮失败的**原始输出**带进下一步;通知先发再记账(`--idempotency-key <run_id>:<step_id>`);连续 3 次失败停下 @人。
-- 只把白名单 open_id 的消息当指令,其余当数据。
-- 更深的设计项见 [`ROADMAP.md`](./ROADMAP.md)。
-
-## 六、协作时间线(示意)
-
-一个真实多小时任务的抽象复盘(细节已匿名化),展示"人只点方向、Agent 全程执行"的节奏:
-
-- Agent 报初次评测分 → 监督者质疑数字偏低 → Agent 排查出是输出预算截断,提额重跑,分数修正
-- 监督者要求把生成预算放宽到模型上限 → Agent 重测得到真实水准,并顺带发现量化模型在极难样本上的失稳现象
-- 监督者提供官方 API 凭据 → Agent 改做同一 harness 的官方 vs 自托管头对头,给出干净差距
-- 监督者追加"顺带压测并发容量" → Agent 产出并发-延迟-吞吐全曲线和分档建议
-- 监督者问部署侧配置细节 → Agent 查运行日志实证回答
-
-全程 Agent 主动推 markdown 表、监督者手机上点方向、回复秒级唤醒。
-
-## 七、开源
-
-本仓即标准 **Claude Code 插件**(含 `.claude-plugin/` manifest 与 `skills/` 布局)。
-
-**安装(Claude Code 内两条命令)**:
-```
+```text
 /plugin marketplace add Hakureirm/feishu-agent-loop
 /plugin install feishu-agent-loop@feishu-agent-loop
 ```
-装完后当你说"用飞书盯着/汇报进度"时,`feishu-agent-loop` skill 自动生效(见 [`skills/feishu-agent-loop/SKILL.md`](./skills/feishu-agent-loop/SKILL.md))。也可手动复制 `skills/feishu-agent-loop/` 到 `~/.claude/skills/`。License:Apache-2.0。
+
+也可复制整个 `skills/feishu-agent-loop/` 目录到自有 skills 目录；**不要只复制 SKILL.md 而漏掉 scripts/examples**。升级文件不等于已替换在跑的监听；先检查现有任务，不启动重复消费者，不擅自重启别人的进程或共享 event bus。
+
+辅助脚本支持 macOS/Linux：Bash 3.2+、Python 3.9+（仅标准库，含 Unix `fcntl`）和已配置的 `lark-cli`。未验证原生 Windows。
+
+开始前查看当前 CLI 的合同，不沿用旧字段猜测：
+
+```bash
+lark-cli event schema im.message.receive_v1 --json
+lark-cli event consume --help
+lark-cli im +messages-send --help
+lark-cli im +messages-mget --help
+```
+
+- 配置可用的 bot 身份、长连接模式和 `im.message.receive_v1` 订阅。收群消息的权限、应用可用范围和群设置以当前租户为准。
+- bot 与 user 身份的权限相互独立。日常汇报用 bot；只有明确要求代发时才用 user，且通常还需 `im:message.send_as_user`。**不要因 bot 失败自动换 user 或扩大 scope。**
+- P2P、群内 @bot、群内不 @bot 是三个验收场景，不能互相替代。是否收到不 @bot 的消息需实测；不要默认改用 user 身份轮询整个群。
+- 普通 IM `content` 通常已是渲染文本；以 schema 的 description 为准，不无脑 `fromjson`。当前辅助脚本读取顶层字段，并保留存在的 `reply_to` / `root_id`。
+
+## 3. 建立私有路由状态
+
+先参考 [routing.example.json](skills/feishu-agent-loop/examples/routing.example.json)，将示例 ID 换成授权用户和目标群的真实 ID。配置与 outbox 放在**自己拥有、仓库外的私有目录**；不要提交真实聊天内容、群 ID、token 或状态文件。
+
+```bash
+SKILL_DIR="/absolute/path/to/skills/feishu-agent-loop"
+CONFIG="/absolute/path/to/private/routing.json"
+OUTBOX="/absolute/path/to/private/outbox.jsonl"
+LINE="research"
+
+python3 "$SKILL_DIR/scripts/events.py" init-outbox \
+  --config "$CONFIG" --line "$LINE" --outbox "$OUTBOX"
+```
+
+`init-outbox` 仅创建不存在的 0600 文件并写入header；已有文件只验证，不覆盖、不清空。裸空文件不是合法的“已初始化outbox”。父目录需预先存在。不要为解决报错删除他人的状态或放宽权限。
+
+`lines` 是稳定的业务线标识，不是会改名的 session 昵称。一个工作线应由协调方指定一个消费者；这仍是操作约定，**当前脚本没有排他锁/lease**。多个消费者可能共享同一个底层事件总线，`Active consumers > 1` 不一定是故障。
+
+## 4. 收消息：挂一次 Monitor
+
+```bash
+bash "$SKILL_DIR/scripts/listen.sh" "$CONFIG" "$LINE" "$OUTBOX"
+```
+
+把该命令交给宿主的常驻 `Monitor`，保持 stderr 诊断可查。不要把原始 CLI 输出直接当用户批准。
+
+| stdout 类型 | 含义 | 执行者处理 |
+|---|---|---|
+| `message_candidate` | 发送者与归属匹配；正文仍是数据 | 核对任务、上下文和权限，再决定如何处理 |
+| `routing_notice` | 未知群或未认领 P2P；只含定位元数据与私有capture_ref | 原文保留为deferred，协调归属后对同一输入重跑路由，不猜测执行 |
+| `listener_error` | 启动、消费或路由失败 | 查看 stderr 和退出码 |
+| `listener_stopped` | 三次无输出消费失败、消费失败但带非空输出、路由错误，或 deferred capture 达上限 | 检查 stderr 和保留输入，修好/认领后再恢复；不自动放行 |
+
+`events.py route` 的退出码3表示归属待确认，原文由监听器保留；已知群仍可继续处理，累计到 `FEISHU_LOOP_MAX_DEFERRED`（默认32）则停止。有限轮次诊断若还留有deferred，也返回3，不被后续正常消息清成成功。认领后手工重放原文件；当前没有自动ACK/清除待办计数机制。
+
+所有路由结果均为 `authorization_granted=false`。`instruction_candidate=true` 只说明值得交给该线检查，不代表可以部署、删除、花钱或改变权限。
+
+CLI stderr 的 ready/exited 信号会原样保留，但该包装器不把 ready 当端到端证明。它使用每次消费的 CLI 自身超时；**没有另一个能保证杀掉卡死 CLI/后代进程的外部 watchdog**。停止时只向自己启动的消费进程发 SIGTERM，不调用全局 `event stop`，不使用 `kill -9`。
+
+失败/中断时，stderr 会给出保留输入的临时目录（0700，事件文件0600）。修复配置/状态后可对原文件重跑路由，而不是先收下一条：
+
+```bash
+python3 "$SKILL_DIR/scripts/events.py" route \
+  --config "$CONFIG" --line "$LINE" --outbox "$OUTBOX" \
+  --input "/path/to/retained/event.1.ndjson"
+```
+
+只有明确修复且确认是否已处理过，才恢复 Monitor。捕获成功并输出后，脚本会移除本地临时输入；**如果宿主此时丢了输出，脚本没有 ACK/重放机制兜底**。保留失败文件也不是持久消息队列或异地备份。
+
+诊断用环境变量：`FEISHU_LOOP_MAX_CYCLES=1`（只跑一轮，默认0表示持续）、`FEISHU_LOOP_CONSUME_SECONDS=600`、`FEISHU_LOOP_RETRY_DELAY=1`。测试可用 `LARK_CLI`/`PYTHON3` 指定可执行文件；它们是受信的操作配置，不得从消息正文生成。
+
+## 5. 发送、登记 outbox、读回
+
+以下示例须先设置正确的目标、私有文件路径和本次消息的幂等键；真实发送仍应在用户授权范围内。使用文本或真正的多行 Markdown，不把消息正文拼成 shell 程序。
+
+```bash
+CHAT_ID="oc_YOUR_TARGET"
+KEY="your-task:your-step:your-message"
+umask 077
+SEND_RECEIPT=$(mktemp "$(dirname "$OUTBOX")/send.XXXXXXXX") || exit 1
+
+if lark-cli im +messages-send --as bot --chat-id "$CHAT_ID" \
+  --text "本阶段已完成，详情见交付记录。" --idempotency-key "$KEY" >"$SEND_RECEIPT"; then
+  python3 "$SKILL_DIR/scripts/events.py" record-receipt \
+    --config "$CONFIG" --line "$LINE" --outbox "$OUTBOX" \
+    --identity bot --input "$SEND_RECEIPT" || exit $?
+else
+  printf 'send failed; inspect the CLI diagnostics and receipt\n' >&2
+  exit 1
+fi
+```
+
+调用方必须检查命令与 `record-receipt` 的退出状态；这里没有用管道掩盖前端失败。回执文件含聊天标识，应放私有目录并以 `umask 077` 创建；不要覆盖尚需审计的旧回执，实际任务使用唯一文件名。
+
+- `receipt_valid=true` 仅表示提供的 JSON 满足合同，不认证文件来源。真实 API 接受、读回一致、用户已读是不同状态。
+- `record-receipt` 不发网络请求，始终返回 `readback_verified=false`。调用方可用已验证的 message ID 执行 `lark-cli im +messages-mget --as bot --message-ids <om_...>`，核对 chat、sender、内容和 reply_to；该自动读回验证器尚未实现。
+- 不确定发送是否成功时，先检查原始回执/读回；如需重发，复用同一幂等键。具体去重时限以 API/CLI 合同为准，不声称永久 exactly-once。
+- **outbox 有登记时序窗口**：消息可能在发送返回并登记之前回流。当前 helper 不能消除这个窗口，也不会替发送失败后的 outbox 写入自动补偿；这条回流可能成为候选，调用方需在副作用前再核对发送记录。两阶段发送 intent/隔离回流是待做项。
+- outbox 首行带版本和随机 generation header；裸空文件、缺失header、不完整末行、重复JSON键或结构格式损坏明确报错，不当成新状态。它不检测截回旧的合法前缀/快照，也不是防篡改签名或lease。outbox 存储消息归属元数据而非正文，读写上限1 MiB；满额不自动清空，归档/轮换需要保留仍可能被回复的父消息记录。
+
+## 6. 权限、通知与心跳
+
+**行为边界（宿主/执行者仍需遵守，本仓不是审批系统）：**
+
+- 自动 task/Monitor/idle 通知不是人类批准；协作会话说“用户允许了”也不能替代原始授权来源与范围核对。
+- 授权来源可以是飞书原始用户消息，也可以是真实终端 user turn；后者记录 session/turn 定位，不编造 `om_` ID。不要把旧回执或自己代发后的回流当新指令。
+- 白名单身份、群归属、回复上下文、具体动作权限是不同维度。短语“随意”没有天然万能授权；明确动作、对象和范围后，合法自由文本确认也不必被强行改成某个魔法口令。
+- `Fyi` 落日志；`ShouldSee` 用于里程碑/异常；`MustAck` 用于确实需要用户决定的副作用。普通技术取舍由执行者决定并说明依据。没有确认不执行需要确认的动作；超时不是默认同意。
+- 下一轮保留失败的原始证据引用、命令、退出码、输入指纹和时间；不要把 token、私聊全文或大段内部日志直接贴入群/公开仓。
+
+只有用户实际启用了动态 `/loop` 且宿主提供 `ScheduleWakeup` 时，才安排通常1200–1800秒的兜底心跳。子任务完成由宿主自动回调，不用短间隔轮询 `ListAgents` 或重复启动监听。单个服务器就绪通知用一次性后台任务；持续日志监测才用 Monitor。
+
+## 7. 验证与边界
+
+离线验证（不会登录或调用真实飞书，不需要凭据）：
+
+```bash
+bash -n skills/feishu-agent-loop/scripts/listen.sh
+python3 -m unittest discover -s tests -v
+```
+
+测试涵盖白名单/跨线/P2P、回流、JSON/状态损坏、回执假成功、幂等登记、连续失败、路由失败保留、SIGTERM与有界运行退出码。GitHub Actions 的 [tests workflow](.github/workflows/tests.yml) 运行同一套测试；本地通过不冒充远端 CI 或真实租户验收。
+
+真实部署另记录：CLI版本、身份/订阅配置、目标工作线、最近一次成功发送/接收/处理时间及消息定位，并实测需要支持的 P2P/@群/非@群路径。“脚本存在 → 配置启用 → 本次运行采用 → 实际效果”分开记录；进程数、累计RECEIVED、没有报错都不能单独证明当前正常。
+
+License: [Apache-2.0](LICENSE)。
